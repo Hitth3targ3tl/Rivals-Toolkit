@@ -48,18 +48,25 @@ interface PakIniInfo {
   pak_name: string;
   pak_path: string;
   has_device_profiles: boolean;
+  has_base_device_profiles: boolean;
   has_engine_ini: boolean;
   has_base_engine: boolean;
   has_windows_engine: boolean;
-  device_profiles_entry: string | null;
-  engine_ini_entry: string | null;
-  base_engine_entry: string | null;
-  windows_engine_entry: string | null;
+  device_profiles_entries: string[];
+  base_device_profiles_entries: string[];
+  engine_ini_entries: string[];
+  base_engine_entries: string[];
+  windows_engine_entries: string[];
 }
 
-// One of the four tweakable INI files, used to render presence badges on each pak.
-// Runtime priority for shared keys: device_profiles > windows_engine > engine > base_engine.
-type PakIniTarget = "base_engine" | "engine" | "windows_engine" | "device_profiles";
+// One of the tweakable INI files, used to render presence badges on each pak. Runtime priority
+// for shared keys: device_profiles > base_device_profiles > windows_engine > engine > base_engine.
+type PakIniTarget =
+  | "base_engine"
+  | "engine"
+  | "windows_engine"
+  | "base_device_profiles"
+  | "device_profiles";
 
 interface TweakSetting {
   id: string;
@@ -154,10 +161,25 @@ function hasAnyEngine(pak: PakIniInfo): boolean {
   return pak.has_engine_ini || pak.has_base_engine || pak.has_windows_engine;
 }
 
+// Engine-section settings are not console variables, so DefaultDeviceProfiles.ini cannot hold
+// them. Without an engine file in the pak they have nowhere to go and the write is a silent no-op.
+function isEngineOnly(tweak: TweakDefinition): boolean {
+  switch (tweak.kind) {
+    case "Toggle":
+    case "Slider":
+      return !!tweak.engine_section;
+    case "BatchToggle":
+      return tweak.entries.some((entry) => !!entry.engine_section);
+    case "RemoveLines":
+      return tweak.lines.some((line) => !!line.engine_section);
+  }
+}
+
 const TARGET_BADGE: Record<PakIniTarget, string> = {
   base_engine: "BaseEngine",
   engine: "Engine",
   windows_engine: "WindowsEngine",
+  base_device_profiles: "BaseDeviceProfiles",
   device_profiles: "DeviceProfiles",
 };
 
@@ -342,7 +364,14 @@ export function PakTweaks({ gamePath, isActive }: Props) {
     }
 
     // Only tweaks the preset names are touched; everything else keeps its current state.
-    const presetMap = new Map(preset.settings.map((s) => [s.id, s]));
+    // A preset can name tweaks this pak cannot hold, so those are dropped rather than shown as
+    // applied: the write would be a no-op and the row would lie until the next scan.
+    const skipped = new Set(
+      hasAnyEngine(selectedPak) ? [] : definitions.filter(isEngineOnly).map((def) => def.id)
+    );
+    const presetMap = new Map(
+      preset.settings.filter((s) => !skipped.has(s.id)).map((s) => [s.id, s])
+    );
 
     setTweakStates((prev) =>
       prev.map((s) => {
@@ -376,6 +405,14 @@ export function PakTweaks({ gamePath, isActive }: Props) {
 
     setPending(next);
     setAppliedPresetAt(preset.modified_at);
+
+    const dropped = preset.settings.filter((s) => skipped.has(s.id)).length;
+    if (dropped > 0) {
+      showNotice(
+        `Skipped ${dropped} tweak${dropped === 1 ? "" : "s"} that need an Engine.ini this pak mod doesn't have`,
+        "info"
+      );
+    }
   }
 
   async function saveCurrentAsPreset() {
@@ -817,6 +854,7 @@ export function PakTweaks({ gamePath, isActive }: Props) {
                         {(
                           [
                             "device_profiles",
+                            "base_device_profiles",
                             "windows_engine",
                             "engine",
                             "base_engine",
@@ -826,6 +864,8 @@ export function PakTweaks({ gamePath, isActive }: Props) {
                             switch (t) {
                               case "device_profiles":
                                 return pak.has_device_profiles;
+                              case "base_device_profiles":
+                                return pak.has_base_device_profiles;
                               case "windows_engine":
                                 return pak.has_windows_engine;
                               case "engine":
@@ -1020,13 +1060,7 @@ export function PakTweaks({ gamePath, isActive }: Props) {
                       </div>
                       <div className="flex flex-col divide-y divide-border/50">
                         {defs.map((tweak) => {
-                          const engineOnly =
-                            (tweak.kind === "Toggle" && !!tweak.engine_section) ||
-                            (tweak.kind === "Slider" && !!tweak.engine_section) ||
-                            (tweak.kind === "BatchToggle" &&
-                              tweak.entries.some((entry) => !!entry.engine_section)) ||
-                            (tweak.kind === "RemoveLines" &&
-                              tweak.lines.some((line) => !!line.engine_section));
+                          const engineOnly = isEngineOnly(tweak);
                           const isEnabled =
                             tweakStates.find((s) => s.id === tweak.id)?.active ?? false;
                           const removeOnly = tweak.kind === "RemoveLines" && tweak.remove_only;

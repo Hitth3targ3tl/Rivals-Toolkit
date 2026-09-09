@@ -93,7 +93,7 @@ enum IniCmd {
     List(PakArgs),
     /// Print merged CVar state, or one INI file's raw contents with `--entry`.
     Get(GetArgs),
-    /// Set CVars, resolving the target INI the same way the app does.
+    /// Set CVars in every INI the pak ships, the same way the app does.
     Set(SetArgs),
     /// Remove CVars from every INI in the pak that sets them.
     Unset(UnsetArgs),
@@ -402,10 +402,12 @@ fn tweaks_apply(cli: &Cli, app: &settings::AppSettings, args: &ApplyArgs) -> Res
         return Err("nothing to do: pass --on, --off, or --set".to_string());
     }
 
-    // Unknown ids and repeats are rejected by core, which the desktop app shares.
+    // Unknown ids and repeats are rejected by core, which the desktop app shares. The error can
+    // name several entries at once, so the hint goes on its own line rather than trailing the
+    // last one.
     let edits = pak_tweaks::edits_for_settings(&settings).map_err(|e| {
-        if e.starts_with("no tweak with id") {
-            format!("{e} (see `rivals-cli tweaks list`)")
+        if e.contains("no tweak with id") {
+            format!("{e}\nRun `rivals-cli tweaks list` for valid ids.")
         } else {
             e
         }
@@ -600,6 +602,9 @@ fn paks_list(cli: &Cli, app: &settings::AppSettings, args: &PaksListArgs) -> Res
             let mut kinds = Vec::new();
             if pak.has_device_profiles {
                 kinds.push("DeviceProfiles");
+            }
+            if pak.has_base_device_profiles {
+                kinds.push("BaseDeviceProfiles");
             }
             if pak.has_windows_engine {
                 kinds.push("WindowsEngine");
