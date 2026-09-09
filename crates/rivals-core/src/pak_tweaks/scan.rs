@@ -82,29 +82,19 @@ pub fn scan_mod_paks_any_ini(
 }
 
 /// Read CVar values from pak INI files, merged in runtime priority order (lowest first,
-/// highest overrides): BaseEngine, DefaultEngine, WindowsEngine, DeviceProfiles. The map
-/// is keyed by lowercased CVar name so insert is O(1); a Vec/retain merge here was O(N^2)
-/// and stalled multi-second on mod paks with full engine INI overrides.
+/// highest overrides): BaseEngine, DefaultEngine, WindowsEngine, BaseDeviceProfiles,
+/// DefaultDeviceProfiles. The map is keyed by lowercased CVar name so insert is O(1); a
+/// Vec/retain merge here was O(N^2) and stalled multi-second on mod paks with full engine
+/// INI overrides.
 pub fn read_pak_cvars(pak_path: &str) -> Result<Vec<PakCvar>, String> {
     let pak_path = Path::new(pak_path);
     let info = inspect_pak_for_ini(pak_path)?
         .ok_or_else(|| "No INI config files found in this pak.".to_string())?;
 
-    let layers: [(Option<&String>, &str); 4] = [
-        (info.base_engine_entry.as_ref(), "BaseEngine.ini"),
-        (info.engine_ini_entry.as_ref(), "DefaultEngine.ini"),
-        (info.windows_engine_entry.as_ref(), "WindowsEngine.ini"),
-        (
-            info.device_profiles_entry.as_ref(),
-            "DefaultDeviceProfiles.ini",
-        ),
-    ];
-
     let mut merged: std::collections::HashMap<String, PakCvar> = std::collections::HashMap::new();
-    for (entry, label) in layers {
-        let Some(entry) = entry else { continue };
+    for (target, entry) in info.layers() {
         let content = extract_file_to_string(pak_path, entry)?;
-        for var in parse_console_vars(&content, label) {
+        for var in parse_console_vars(&content, target.source_label()) {
             merged.insert(var.key.to_ascii_lowercase(), var);
         }
     }
@@ -142,7 +132,7 @@ pub fn extract_game_default_ini(
 /// Sanitize a user-typed pak name into the toolkit's mod convention
 /// `<name>_9999999_P.pak`. Strips invalid Windows filename chars, idempotently
 /// strips an existing `_9999999_P` suffix or `.pak` extension before re-applying.
-fn normalize_pak_filename(raw: &str) -> Result<String, String> {
+pub(crate) fn normalize_pak_filename(raw: &str) -> Result<String, String> {
     const PRIORITY_SUFFIX: &str = "_9999999_P";
 
     let trimmed = raw.trim();

@@ -8,162 +8,115 @@ use crate::pak::profile::strip_mount_prefix;
 
 use super::cvars::{IniType, apply_edits_to_ini, parse_console_vars};
 use super::io::{inspect_pak_for_ini, with_unpacked_pak};
-use super::{PakIniFileContent, PakIniInfo, PakIniTarget, PakTweakEdit};
+use super::{PakIniFileContent, PakIniTarget, PakTweakEdit};
 
-/// Engine-file targets in runtime priority order, lowest first.
-const ENGINE_TARGETS: [PakIniTarget; 3] = [
-    PakIniTarget::BaseEngine,
-    PakIniTarget::Engine,
-    PakIniTarget::WindowsEngine,
-];
+/// One INI file out of a pak, tagged with the config layer it belongs to.
+#[derive(Debug, Clone)]
+pub(super) struct LayerFile {
+    pub target: PakIniTarget,
+    pub content: String,
+}
 
-/// Apply catalogue-driven edits to a pak's INI files and repack in place.
+impl LayerFile {
+    fn ini_type(&self) -> IniType {
+        if self.target.is_engine() {
+            IniType::Engine
+        } else {
+            IniType::DeviceProfiles
+        }
+    }
+}
+
+/// Apply `edits` across every INI file a pak ships.
 ///
-/// Plain CVar edits are written to the highest-priority file present in the pak so a
-/// new key takes effect without being shadowed. Engine-section settings are not console
-/// variables and only belong in an engine file: they go to the highest-priority engine
-/// file present. Every other file that already contains an edited key is kept in sync
-/// so no higher-priority file shadows the user's edit; keys absent from a file are
-/// never injected into it.
+/// A value is written to every file, so opening any one of them shows the tweak and no file can
+/// shadow another with a stale copy. A removal clears the key from every file and every section
+/// that sets it, since whichever copy survives is the one the game ends up reading. Engine-section
+/// settings are not console variables, so they stay inside engine files.
+pub(super) fn apply_edits_to_layers(files: &mut [LayerFile], edits: &[PakTweakEdit]) {
+    let (engine_section_edits, plain_edits): (Vec<PakTweakEdit>, Vec<PakTweakEdit>) = edits
+        .iter()
+        .cloned()
+        .partition(|e| e.engine_section.is_some());
+
+    apply_group(files, &plain_edits, |_| true);
+    apply_group(files, &engine_section_edits, PakIniTarget::is_engine);
+}
+
+fn apply_group(
+    files: &mut [LayerFile],
+    edits: &[PakTweakEdit],
+    eligible: fn(PakIniTarget) -> bool,
+) {
+    if edits.is_empty() {
+        return;
+    }
+    let any_removal = edits.iter().any(|e| e.value.is_none());
+
+    for file in files.iter_mut().filter(|f| eligible(f.target)) {
+        // A removal has nothing to do in a file that never sets the key, and skipping it keeps
+        // that file byte-for-byte instead of reformatting it for nothing.
+        let present: HashSet<String> = if any_removal {
+            parse_console_vars(&file.content, file.target.source_label())
+                .into_iter()
+                .map(|v| v.key.to_ascii_lowercase())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let applicable: Vec<PakTweakEdit> = edits
+            .iter()
+            .filter(|e| e.value.is_some() || present.contains(&e.key.to_ascii_lowercase()))
+            .cloned()
+            .collect();
+        if applicable.is_empty() {
+            continue;
+        }
+        file.content = apply_edits_to_ini(&file.content, &applicable, file.ini_type());
+    }
+}
+
+/// Apply catalogue-driven edits to a pak INI files and repack in place.
 pub fn apply_pak_tweaks(pak_path: &str, edits: &[PakTweakEdit]) -> Result<String, String> {
     let pak = Path::new(pak_path);
     let info = inspect_pak_for_ini(pak)?
         .ok_or_else(|| "No INI config files found in this pak.".to_string())?;
     let pak_name = info.pak_name.clone();
     let edit_count = edits.len();
-
-    let resolved = resolve_target(&info)?;
-    // Engine-section edits need an engine file. Prefer the user's target if it's an
-    // engine file; otherwise the highest-priority engine file present.
-    let engine_section_target = if is_engine(resolved) {
-        Some(resolved)
-    } else {
-        highest_engine_present(&info)
-    };
+    let layers: Vec<(PakIniTarget, String)> = info
+        .layers()
+        .into_iter()
+        .map(|(target, entry)| (target, entry.to_string()))
+        .collect();
 
     with_unpacked_pak(pak, |temp_dir| {
-        let (engine_section_edits, plain_edits): (Vec<PakTweakEdit>, Vec<PakTweakEdit>) = edits
-            .iter()
-            .cloned()
-            .partition(|e| e.engine_section.is_some());
-
-        let target_entry = entry_for(&info, resolved)
-            .ok_or("Target INI entry missing despite target resolution")?;
-        apply_edits_to_file(temp_dir, target_entry, ini_type_for(resolved), &plain_edits)?;
-
-        if !engine_section_edits.is_empty()
-            && let Some(eng_target) = engine_section_target
-            && let Some(eng_entry) = entry_for(&info, eng_target)
-        {
-            apply_edits_to_file(temp_dir, eng_entry, IniType::Engine, &engine_section_edits)?;
+        let mut files = Vec::with_capacity(layers.len());
+        for (target, entry) in &layers {
+            let path = temp_dir.join(strip_mount_prefix(entry));
+            let content = fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read extracted INI {}: {}", path.display(), e))?;
+            files.push(LayerFile {
+                target: *target,
+                content,
+            });
         }
+        let originals: Vec<String> = files.iter().map(|f| f.content.clone()).collect();
 
-        // Sync every other file that already contains a plain-edited key. Plain
-        // edits and engine_section edits never collide on the same key, so the
-        // engine_section_target file is still a valid sibling for plain edits.
-        for sibling in all_targets().into_iter().filter(|t| *t != resolved) {
-            if let Some(sib_entry) = entry_for(&info, sibling) {
-                sync_existing_keys(
-                    temp_dir,
-                    sib_entry,
-                    ini_type_for(sibling),
-                    source_label(sibling),
-                    &plain_edits,
-                )?;
+        apply_edits_to_layers(&mut files, edits);
+
+        for (((_, entry), file), original) in layers.iter().zip(&files).zip(&originals) {
+            if &file.content == original {
+                continue;
             }
+            let path = temp_dir.join(strip_mount_prefix(entry));
+            fs::write(&path, &file.content)
+                .map_err(|e| format!("Failed to write modified INI {}: {}", path.display(), e))?;
         }
-
-        // Engine-section edits also need sibling sync across the other engine files.
-        if !engine_section_edits.is_empty()
-            && let Some(eng_target) = engine_section_target
-        {
-            for sibling in ENGINE_TARGETS.iter().copied().filter(|t| *t != eng_target) {
-                if let Some(sib_entry) = entry_for(&info, sibling) {
-                    sync_existing_keys(
-                        temp_dir,
-                        sib_entry,
-                        IniType::Engine,
-                        source_label(sibling),
-                        &engine_section_edits,
-                    )?;
-                }
-            }
-        }
-
         Ok(())
     })?;
 
     let label = if edit_count == 1 { "change" } else { "changes" };
     Ok(format!("Applied {edit_count} {label} to {pak_name}"))
-}
-
-/// Pick the highest-priority file present in the pak (DeviceProfiles > WindowsEngine >
-/// DefaultEngine > BaseEngine) so a new edit takes effect without being shadowed.
-fn resolve_target(info: &PakIniInfo) -> Result<PakIniTarget, String> {
-    for candidate in [
-        PakIniTarget::DeviceProfiles,
-        PakIniTarget::WindowsEngine,
-        PakIniTarget::Engine,
-        PakIniTarget::BaseEngine,
-    ] {
-        if entry_for(info, candidate).is_some() {
-            return Ok(candidate);
-        }
-    }
-    Err("No INI config files found in this pak.".to_string())
-}
-
-fn all_targets() -> [PakIniTarget; 4] {
-    [
-        PakIniTarget::BaseEngine,
-        PakIniTarget::Engine,
-        PakIniTarget::WindowsEngine,
-        PakIniTarget::DeviceProfiles,
-    ]
-}
-
-fn is_engine(target: PakIniTarget) -> bool {
-    !matches!(target, PakIniTarget::DeviceProfiles)
-}
-
-/// Highest-priority engine file actually present in the pak.
-fn highest_engine_present(info: &PakIniInfo) -> Option<PakIniTarget> {
-    [
-        PakIniTarget::WindowsEngine,
-        PakIniTarget::Engine,
-        PakIniTarget::BaseEngine,
-    ]
-    .into_iter()
-    .find(|&candidate| entry_for(info, candidate).is_some())
-}
-
-fn entry_for(info: &PakIniInfo, target: PakIniTarget) -> Option<&String> {
-    match target {
-        PakIniTarget::BaseEngine => info.base_engine_entry.as_ref(),
-        PakIniTarget::Engine => info.engine_ini_entry.as_ref(),
-        PakIniTarget::WindowsEngine => info.windows_engine_entry.as_ref(),
-        PakIniTarget::DeviceProfiles => info.device_profiles_entry.as_ref(),
-    }
-}
-
-fn ini_type_for(target: PakIniTarget) -> IniType {
-    match target {
-        PakIniTarget::BaseEngine | PakIniTarget::Engine | PakIniTarget::WindowsEngine => {
-            IniType::Engine
-        }
-        PakIniTarget::DeviceProfiles => IniType::DeviceProfiles,
-    }
-}
-
-/// `parse_console_vars` switches parsing rules based on whether the source name
-/// contains "DeviceProfiles", so the label must reflect the file kind.
-fn source_label(target: PakIniTarget) -> &'static str {
-    match target {
-        PakIniTarget::BaseEngine => "BaseEngine.ini",
-        PakIniTarget::Engine => "DefaultEngine.ini",
-        PakIniTarget::WindowsEngine => "WindowsEngine.ini",
-        PakIniTarget::DeviceProfiles => "DefaultDeviceProfiles.ini",
-    }
 }
 
 /// Replace raw INI file contents in a pak and repack in place. `files` writes are
@@ -208,56 +161,1139 @@ pub fn save_pak_ini(
     Ok(format!("Saved {} change(s) to {}", change_count, pak_name))
 }
 
-/// Read an extracted pak INI, apply `edits`, and write it back.
-fn apply_edits_to_file(
-    temp_dir: &Path,
-    entry: &str,
-    ini_type: IniType,
-    edits: &[PakTweakEdit],
-) -> Result<(), String> {
-    if edits.is_empty() {
-        return Ok(());
-    }
-    let file = temp_dir.join(strip_mount_prefix(entry));
-    let content = fs::read_to_string(&file)
-        .map_err(|e| format!("Failed to read extracted INI {}: {}", file.display(), e))?;
-    let modified = apply_edits_to_ini(&content, edits, ini_type);
-    fs::write(&file, &modified)
-        .map_err(|e| format!("Failed to write modified INI {}: {}", file.display(), e))?;
-    Ok(())
-}
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    //! Full-pak verification: build the five INI files a config mod can ship, seed the same
+    //! CVar into every file and every section that is live at runtime, then drive the real
+    //! `apply_edits_to_layers` and assert nothing survives that should not.
+    //!
+    //! The bug this suite exists for: a leftover copy in `BaseDeviceProfiles.ini` or in
+    //! `[WindowsClient DeviceProfile]` kept applying after the toggle reported the fix as done.
 
-/// Apply only the edits whose key already exists in the sibling file, so the two
-/// INIs stay consistent without injecting keys the sibling never had.
-fn sync_existing_keys(
-    temp_dir: &Path,
-    entry: &str,
-    ini_type: IniType,
-    source_label: &str,
-    edits: &[PakTweakEdit],
-) -> Result<(), String> {
-    if edits.is_empty() {
-        return Ok(());
-    }
-    let file = temp_dir.join(strip_mount_prefix(entry));
-    let content = fs::read_to_string(&file)
-        .map_err(|e| format!("Failed to read sibling INI {}: {}", file.display(), e))?;
+    use super::*;
+    use crate::pak_tweaks::{PakCvar, edits_for_settings, edits_for_tweak};
+    use crate::tweaks::catalogue::{TweakDefinition, TweakKind, tweak_catalogue};
+    use crate::tweaks::{TweakSetting, TweakState, detect_tweaks_unscoped};
 
-    let present: HashSet<String> = parse_console_vars(&content, source_label)
-        .into_iter()
-        .map(|s| s.key.to_ascii_lowercase())
-        .collect();
-    let filtered: Vec<PakTweakEdit> = edits
-        .iter()
-        .filter(|e| present.contains(&e.key.to_ascii_lowercase()))
-        .cloned()
-        .collect();
-    if filtered.is_empty() {
-        return Ok(());
+    /// Windows device profiles the shipping client can run. `Windows` is the active one and the
+    /// rest inherit from it, so a CVar parked in any of them still reaches the game.
+    const DP_SECTIONS: [&str; 4] = [
+        "[Windows DeviceProfile]",
+        "[WindowsClient DeviceProfile]",
+        "[WindowsNoEditor DeviceProfile]",
+        "[WindowsServer DeviceProfile]",
+    ];
+
+    /// Engine sections a config mod scatters console variables across.
+    const ENGINE_SECTIONS: [&str; 2] = ["[ConsoleVariables]", "[SystemSettings]"];
+
+    fn layer(target: PakIniTarget, content: String) -> LayerFile {
+        LayerFile { target, content }
     }
 
-    let modified = apply_edits_to_ini(&content, &filtered, ini_type);
-    fs::write(&file, &modified)
-        .map_err(|e| format!("Failed to write sibling INI {}: {}", file.display(), e))?;
-    Ok(())
+    fn plain(edits: &[PakTweakEdit]) -> Vec<&PakTweakEdit> {
+        edits
+            .iter()
+            .filter(|e| e.engine_section.is_none())
+            .collect()
+    }
+
+    /// Engine file holding every key the edits touch, duplicated across both console-variable
+    /// sections plus each explicit engine section.
+    fn seeded_engine(edits: &[PakTweakEdit], value: &str) -> String {
+        let mut out = String::new();
+        for section in ENGINE_SECTIONS {
+            out.push_str(section);
+            out.push_str("\r\n");
+            for edit in plain(edits) {
+                out.push_str(&format!("{}={}\r\n", edit.key, value));
+            }
+            out.push_str("\r\n");
+        }
+        let mut sections: Vec<&str> = Vec::new();
+        for section in edits.iter().filter_map(|e| e.engine_section.as_deref()) {
+            if !sections.contains(&section) {
+                sections.push(section);
+            }
+        }
+        for section in sections {
+            out.push_str(&format!("[{section}]\r\n"));
+            for edit in edits
+                .iter()
+                .filter(|e| e.engine_section.as_deref() == Some(section))
+            {
+                out.push_str(&format!("{}={}\r\n", edit.key, value));
+            }
+            out.push_str("\r\n");
+        }
+        out
+    }
+
+    /// DeviceProfiles file holding every plain key under every Windows profile.
+    fn seeded_dp(edits: &[PakTweakEdit], value: &str) -> String {
+        let mut out = String::new();
+        for section in DP_SECTIONS {
+            out.push_str(section);
+            out.push_str("\r\nDeviceType=Windows\r\n");
+            for edit in plain(edits) {
+                out.push_str(&format!("+CVars={}={}\r\n", edit.key, value));
+            }
+            out.push_str("\r\n");
+        }
+        out
+    }
+
+    /// The five-file pak the report came from, with `value` already set everywhere.
+    fn seeded_pak(edits: &[PakTweakEdit], value: &str) -> Vec<LayerFile> {
+        vec![
+            layer(PakIniTarget::BaseEngine, seeded_engine(edits, value)),
+            layer(PakIniTarget::Engine, seeded_engine(edits, value)),
+            layer(PakIniTarget::WindowsEngine, seeded_engine(edits, value)),
+            layer(PakIniTarget::BaseDeviceProfiles, seeded_dp(edits, value)),
+            layer(PakIniTarget::DeviceProfiles, seeded_dp(edits, value)),
+        ]
+    }
+
+    /// The same five files with section headers but no CVars.
+    fn empty_pak() -> Vec<LayerFile> {
+        let engine = format!(
+            "{}\r\n\r\n{}\r\n\r\n",
+            ENGINE_SECTIONS[0], ENGINE_SECTIONS[1]
+        );
+        let dp = format!("{}\r\nDeviceType=Windows\r\n\r\n", DP_SECTIONS[0]);
+        vec![
+            layer(PakIniTarget::BaseEngine, engine.clone()),
+            layer(PakIniTarget::Engine, engine.clone()),
+            layer(PakIniTarget::WindowsEngine, engine),
+            layer(PakIniTarget::BaseDeviceProfiles, dp.clone()),
+            layer(PakIniTarget::DeviceProfiles, dp),
+        ]
+    }
+
+    /// Every assignment of `key` anywhere in the pak, in any section, comment lines excluded.
+    /// Deliberately section-blind: a survivor in a section the editor does not know about is
+    /// exactly the failure being tested for.
+    fn key_hits(files: &[LayerFile], key: &str) -> Vec<(PakIniTarget, String)> {
+        let key_lower = key.to_ascii_lowercase();
+        let mut hits = Vec::new();
+        for file in files {
+            for line in file.content.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with(';') {
+                    continue;
+                }
+                let inner = trimmed
+                    .strip_prefix("+CVars=")
+                    .or_else(|| trimmed.strip_prefix("+cvars="))
+                    .unwrap_or(trimmed);
+                if let Some((k, v)) = inner.split_once('=')
+                    && k.trim().to_ascii_lowercase() == key_lower
+                {
+                    hits.push((file.target, v.trim().to_string()));
+                }
+            }
+        }
+        hits
+    }
+
+    fn hits_in(files: &[LayerFile], target: PakIniTarget, key: &str) -> usize {
+        key_hits(files, key)
+            .iter()
+            .filter(|(t, _)| *t == target)
+            .count()
+    }
+
+    /// The flat key=value view `read_pak_cvars` builds, lowest priority first so the last
+    /// layer wins, fed to the detector exactly as `detect_pak_tweaks` does.
+    fn merged(files: &[LayerFile]) -> String {
+        let mut merged: Vec<PakCvar> = Vec::new();
+        for file in files {
+            for var in parse_console_vars(&file.content, file.target.source_label()) {
+                let key_lower = var.key.to_ascii_lowercase();
+                merged.retain(|v| v.key.to_ascii_lowercase() != key_lower);
+                merged.push(var);
+            }
+        }
+        merged
+            .iter()
+            .map(|v| format!("{}={}", v.key, v.value))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn is_active(files: &[LayerFile], id: &str) -> bool {
+        detect_tweaks_unscoped(&merged(files))
+            .into_iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("no detected state for {id}"))
+            .active
+    }
+
+    /// ON-state edits built by the same translation both front ends call.
+    fn edits_on(def: &TweakDefinition) -> Vec<PakTweakEdit> {
+        edits_for_tweak(def, true, slider_target(def).as_deref())
+            .unwrap_or_else(|e| panic!("{} failed to translate ON: {e}", def.id))
+    }
+
+    /// A slider only reads back as enabled away from its default, so an ON request picks the far
+    /// end of the range. Everything else takes its values from the catalogue.
+    fn slider_target(def: &TweakDefinition) -> Option<String> {
+        match &def.kind {
+            TweakKind::Slider {
+                min,
+                max,
+                default_value,
+                ..
+            } => {
+                let away = if (default_value - min).abs() < f64::EPSILON {
+                    max
+                } else {
+                    min
+                };
+                Some(format!("{away}"))
+            }
+            _ => None,
+        }
+    }
+
+    /// OFF-state edits, or `None` for tweaks that only remove and cannot be restored.
+    fn edits_off(def: &TweakDefinition) -> Option<Vec<PakTweakEdit>> {
+        edits_for_tweak(def, false, None).ok()
+    }
+
+    /// A set must reach every file that already had the key, and a removal must clear the key
+    /// out of every file and every section.
+    fn assert_edit_landed(files: &[LayerFile], edit: &PakTweakEdit, what: &str) {
+        let hits = key_hits(files, &edit.key);
+        match edit.value.as_deref() {
+            None => assert!(
+                hits.is_empty(),
+                "{what}: {} survives in {:?}",
+                edit.key,
+                hits
+            ),
+            Some(expected) => {
+                assert!(!hits.is_empty(), "{what}: {} was never written", edit.key);
+                for (target, value) in &hits {
+                    assert_eq!(
+                        value, expected,
+                        "{what}: {} in {target:?} should be {expected}",
+                        edit.key
+                    );
+                }
+            }
+        }
+    }
+
+    fn edit(key: &str, value: Option<&str>) -> PakTweakEdit {
+        PakTweakEdit {
+            key: key.into(),
+            value: value.map(str::to_string),
+            engine_section: None,
+        }
+    }
+
+    // ── The reported bug ──────────────────────────────────────────────
+
+    #[test]
+    fn mipmap_fix_clears_every_file_and_every_windows_profile() {
+        let def = tweak_catalogue()
+            .into_iter()
+            .find(|t| t.id == "fix_mipmap_bias")
+            .expect("fix_mipmap_bias");
+        let edits = edits_on(&def);
+        let mut files = seeded_pak(&edits, "15");
+
+        assert!(
+            !is_active(&files, "fix_mipmap_bias"),
+            "the seeded pak must read as not-yet-fixed"
+        );
+
+        apply_edits_to_layers(&mut files, &edits);
+
+        assert!(
+            key_hits(&files, "r.MipMapLODBias").is_empty(),
+            "every copy must go, including BaseDeviceProfiles and the inherited profiles:\n{:#?}",
+            key_hits(&files, "r.MipMapLODBias")
+        );
+        assert!(is_active(&files, "fix_mipmap_bias"));
+    }
+
+    #[test]
+    fn a_copy_only_in_base_device_profiles_is_seen_and_removed() {
+        let mut files = empty_pak();
+        files[3].content = "[Windows DeviceProfile]\r\n+CVars=r.MipMapLODBias=15\r\n".into();
+
+        assert!(
+            !is_active(&files, "fix_mipmap_bias"),
+            "BaseDeviceProfiles must be part of the merged read"
+        );
+
+        let def = tweak_catalogue()
+            .into_iter()
+            .find(|t| t.id == "fix_mipmap_bias")
+            .expect("fix_mipmap_bias");
+        apply_edits_to_layers(&mut files, &edits_on(&def));
+
+        assert!(key_hits(&files, "r.MipMapLODBias").is_empty());
+    }
+
+    #[test]
+    fn a_copy_only_in_an_inherited_profile_is_seen_and_removed() {
+        let mut files = empty_pak();
+        files[4].content = concat!(
+            "[Windows DeviceProfile]\r\n",
+            "DeviceType=Windows\r\n\r\n",
+            "[WindowsClient DeviceProfile]\r\n",
+            "BaseProfileName=Windows\r\n",
+            "+CVars=r.MipMapLODBias=15\r\n"
+        )
+        .into();
+
+        assert!(!is_active(&files, "fix_mipmap_bias"));
+
+        let def = tweak_catalogue()
+            .into_iter()
+            .find(|t| t.id == "fix_mipmap_bias")
+            .expect("fix_mipmap_bias");
+        apply_edits_to_layers(&mut files, &edits_on(&def));
+
+        assert!(key_hits(&files, "r.MipMapLODBias").is_empty());
+    }
+
+    // ── Force Default Material, both directions ───────────────────────
+
+    #[test]
+    fn force_default_material_off_clears_every_instance_then_on_restores_one_per_file() {
+        let def = tweak_catalogue()
+            .into_iter()
+            .find(|t| t.id == "force_default_material")
+            .expect("force_default_material");
+        let key = "r.debug.ForceDefaultMtl";
+
+        let on = edits_on(&def);
+        let mut files = seeded_pak(&on, "1");
+        assert_eq!(
+            key_hits(&files, key).len(),
+            14,
+            "seed: 2 engine sections x 3 engine files + 4 profiles x 2 device profile files"
+        );
+        assert!(is_active(&files, "force_default_material"));
+
+        let off = edits_off(&def).expect("force_default_material can be turned off");
+        apply_edits_to_layers(&mut files, &off);
+        assert!(
+            key_hits(&files, key).is_empty(),
+            "turning it off must remove every copy:\n{:#?}",
+            key_hits(&files, key)
+        );
+        assert!(!is_active(&files, "force_default_material"));
+
+        apply_edits_to_layers(&mut files, &on);
+        let hits = key_hits(&files, key);
+        assert_eq!(
+            hits,
+            vec![
+                (PakIniTarget::BaseEngine, "1".into()),
+                (PakIniTarget::Engine, "1".into()),
+                (PakIniTarget::WindowsEngine, "1".into()),
+                (PakIniTarget::BaseDeviceProfiles, "1".into()),
+                (PakIniTarget::DeviceProfiles, "1".into()),
+            ],
+            "turning it back on writes one line per file, so every file shows the tweak"
+        );
+        assert!(
+            files[4]
+                .content
+                .contains("+CVars=r.debug.ForceDefaultMtl=1"),
+            "device profile CVars need the +CVars= prefix:\n{}",
+            files[4].content
+        );
+        assert!(is_active(&files, "force_default_material"));
+    }
+
+    // ── Whole-catalogue sweeps ────────────────────────────────────────
+
+    #[test]
+    fn every_tweak_turned_on_reaches_every_instance() {
+        for def in tweak_catalogue() {
+            let edits = edits_on(&def);
+            if edits.is_empty() {
+                continue;
+            }
+            let mut files = seeded_pak(&edits, "999");
+            apply_edits_to_layers(&mut files, &edits);
+            for edit in &edits {
+                assert_edit_landed(&files, edit, &format!("{} ON", def.id));
+            }
+            assert!(
+                is_active(&files, &def.id),
+                "{} should read active after being turned on",
+                def.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_tweak_turned_off_reaches_every_instance() {
+        for def in tweak_catalogue() {
+            let on = edits_on(&def);
+            let Some(off) = edits_off(&def) else {
+                continue;
+            };
+            if off.is_empty() {
+                continue;
+            }
+            let mut files = seeded_pak(&on, "999");
+            apply_edits_to_layers(&mut files, &off);
+            for edit in &off {
+                assert_edit_landed(&files, edit, &format!("{} OFF", def.id));
+            }
+            assert!(
+                !is_active(&files, &def.id),
+                "{} should read inactive after being turned off",
+                def.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_tweak_turned_on_from_scratch_writes_to_every_managed_file() {
+        for def in tweak_catalogue() {
+            let edits = edits_on(&def);
+            if edits.is_empty() {
+                continue;
+            }
+            let mut files = empty_pak();
+            apply_edits_to_layers(&mut files, &edits);
+
+            for edit in &edits {
+                let hits = key_hits(&files, &edit.key);
+                match edit.value.as_deref() {
+                    None => assert!(
+                        hits.is_empty(),
+                        "{}: a removal must not inject {}",
+                        def.id,
+                        edit.key
+                    ),
+                    Some(expected) => {
+                        // An engine-section setting is not a console variable, so a device
+                        // profile cannot hold it.
+                        let want: Vec<(PakIniTarget, String)> = PakIniTarget::ALL
+                            .iter()
+                            .filter(|t| edit.engine_section.is_none() || t.is_engine())
+                            .map(|t| (*t, expected.to_string()))
+                            .collect();
+                        assert_eq!(
+                            hits, want,
+                            "{}: {} should be written to every file that can hold it",
+                            def.id, edit.key
+                        );
+                    }
+                }
+            }
+            assert!(is_active(&files, &def.id), "{} should read active", def.id);
+        }
+    }
+
+    #[test]
+    fn applying_the_same_tweak_twice_changes_nothing() {
+        for def in tweak_catalogue() {
+            let edits = edits_on(&def);
+            if edits.is_empty() {
+                continue;
+            }
+            for mut files in [seeded_pak(&edits, "999"), empty_pak()] {
+                apply_edits_to_layers(&mut files, &edits);
+                let once: Vec<String> = files.iter().map(|f| f.content.clone()).collect();
+                apply_edits_to_layers(&mut files, &edits);
+                let twice: Vec<String> = files.iter().map(|f| f.content.clone()).collect();
+                assert_eq!(once, twice, "{} is not idempotent", def.id);
+            }
+        }
+    }
+
+    #[test]
+    fn every_tweak_survives_an_on_off_on_cycle() {
+        for def in tweak_catalogue() {
+            let on = edits_on(&def);
+            let Some(off) = edits_off(&def) else {
+                continue;
+            };
+            if on.is_empty() {
+                continue;
+            }
+            let mut files = seeded_pak(&on, "999");
+            apply_edits_to_layers(&mut files, &on);
+            apply_edits_to_layers(&mut files, &off);
+            assert!(!is_active(&files, &def.id), "{} stuck on", def.id);
+            apply_edits_to_layers(&mut files, &on);
+            assert!(is_active(&files, &def.id), "{} stuck off", def.id);
+            for edit in &on {
+                assert_edit_landed(&files, edit, &format!("{} ON again", def.id));
+            }
+        }
+    }
+
+    // ── Layer routing ─────────────────────────────────────────────────
+
+    /// Every file the editor manages gets the value, so a pak with several config files shows
+    /// the tweak wherever you open it and no stale copy is left to shadow the others.
+    #[test]
+    fn a_set_reaches_every_file() {
+        let mut files = empty_pak();
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", Some("1"))]);
+        assert_eq!(
+            key_hits(&files, "r.Foo"),
+            vec![
+                (PakIniTarget::BaseEngine, "1".into()),
+                (PakIniTarget::Engine, "1".into()),
+                (PakIniTarget::WindowsEngine, "1".into()),
+                (PakIniTarget::BaseDeviceProfiles, "1".into()),
+                (PakIniTarget::DeviceProfiles, "1".into()),
+            ]
+        );
+        assert!(
+            files[4].content.contains("+CVars=r.Foo=1"),
+            "device profile CVars need the +CVars= prefix:\n{}",
+            files[4].content
+        );
+        assert!(
+            files[0].content.contains("[ConsoleVariables]\r\nr.Foo=1"),
+            "engine CVars land in [ConsoleVariables]:\n{}",
+            files[0].content
+        );
+    }
+
+    #[test]
+    fn a_stale_value_is_overwritten_rather_than_duplicated() {
+        let mut files = empty_pak();
+        files[0].content = "[ConsoleVariables]\r\nr.Foo=0\r\n".into();
+
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", Some("1"))]);
+
+        assert_eq!(hits_in(&files, PakIniTarget::BaseEngine, "r.Foo"), 1);
+        assert!(!files[0].content.contains("r.Foo=0"));
+    }
+
+    #[test]
+    fn a_removal_clears_all_five_files() {
+        let mut files = seeded_pak(&[edit("r.Foo", None)], "3");
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", None)]);
+        assert!(key_hits(&files, "r.Foo").is_empty());
+    }
+
+    #[test]
+    fn a_set_only_reaches_the_files_the_pak_actually_ships() {
+        let mut files: Vec<LayerFile> = empty_pak().into_iter().take(3).collect();
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", Some("1"))]);
+        assert_eq!(
+            key_hits(&files, "r.Foo"),
+            vec![
+                (PakIniTarget::BaseEngine, "1".into()),
+                (PakIniTarget::Engine, "1".into()),
+                (PakIniTarget::WindowsEngine, "1".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_device_profiles_is_written_like_any_other_layer() {
+        let mut files: Vec<LayerFile> = empty_pak().into_iter().take(4).collect();
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", Some("1"))]);
+        assert_eq!(
+            hits_in(&files, PakIniTarget::BaseDeviceProfiles, "r.Foo"),
+            1
+        );
+        assert!(files[3].content.contains("+CVars=r.Foo=1"));
+    }
+
+    #[test]
+    fn engine_section_settings_never_reach_device_profiles() {
+        let mut files = empty_pak();
+        let edit = PakTweakEdit {
+            key: "ApplicationScale".into(),
+            value: Some("1.5".into()),
+            engine_section: Some("/Script/Engine.UserInterfaceSettings".into()),
+        };
+        apply_edits_to_layers(&mut files, &[edit]);
+
+        assert_eq!(
+            key_hits(&files, "ApplicationScale"),
+            vec![
+                (PakIniTarget::BaseEngine, "1.5".into()),
+                (PakIniTarget::Engine, "1.5".into()),
+                (PakIniTarget::WindowsEngine, "1.5".into()),
+            ],
+            "an engine-section setting reaches every engine file, never a device profile"
+        );
+        assert!(
+            files[2]
+                .content
+                .contains("[/Script/Engine.UserInterfaceSettings]")
+        );
+    }
+
+    #[test]
+    fn engine_section_removals_clear_every_engine_file() {
+        let seed = PakTweakEdit {
+            key: "MaxClientRate".into(),
+            value: Some("300000".into()),
+            engine_section: Some("/Script/OnlineSubsystemUtils.IpNetDriver".into()),
+        };
+        let mut files = seeded_pak(std::slice::from_ref(&seed), "300000");
+        let removal = PakTweakEdit {
+            value: None,
+            ..seed
+        };
+        apply_edits_to_layers(&mut files, &[removal]);
+        assert!(key_hits(&files, "MaxClientRate").is_empty());
+    }
+
+    // ── Duplicate files inside one layer ──────────────────────────────
+
+    #[test]
+    fn duplicate_files_in_one_layer_are_all_cleaned() {
+        // A pak shipping Engine/Config/Windows/BaseWindowsEngine.ini next to
+        // Marvel/Config/Windows/WindowsEngine.ini: both are WindowsEngine, both are live.
+        let mut files = vec![
+            layer(
+                PakIniTarget::WindowsEngine,
+                "[ConsoleVariables]\r\nr.MipMapLODBias=15\r\n".into(),
+            ),
+            layer(
+                PakIniTarget::WindowsEngine,
+                "[ConsoleVariables]\r\nr.MipMapLODBias=15\r\n".into(),
+            ),
+        ];
+        apply_edits_to_layers(&mut files, &[edit("r.MipMapLODBias", None)]);
+        assert!(key_hits(&files, "r.MipMapLODBias").is_empty());
+    }
+
+    #[test]
+    fn a_new_key_reaches_both_files_of_a_shared_layer() {
+        let mut files = vec![
+            layer(PakIniTarget::WindowsEngine, "[ConsoleVariables]\r\n".into()),
+            layer(PakIniTarget::WindowsEngine, "[ConsoleVariables]\r\n".into()),
+        ];
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", Some("1"))]);
+        assert!(files[0].content.contains("r.Foo=1"));
+        assert!(files[1].content.contains("r.Foo=1"));
+    }
+
+    // ── Sections the editor must leave alone ──────────────────────────
+
+    #[test]
+    fn non_windows_device_profiles_are_left_alone() {
+        let mut files = vec![layer(
+            PakIniTarget::DeviceProfiles,
+            concat!(
+                "[Windows DeviceProfile]\r\n",
+                "+CVars=r.MipMapLODBias=15\r\n\r\n",
+                "[IOS DeviceProfile]\r\n",
+                "+CVars=r.MipMapLODBias=15\r\n"
+            )
+            .into(),
+        )];
+        apply_edits_to_layers(&mut files, &[edit("r.MipMapLODBias", None)]);
+
+        assert_eq!(
+            files[0].content.matches("r.MipMapLODBias").count(),
+            1,
+            "only the Windows profile is the game running on this platform:\n{}",
+            files[0].content
+        );
+        assert!(files[0].content.contains("[IOS DeviceProfile]"));
+    }
+
+    #[test]
+    fn commented_out_lines_are_left_alone() {
+        let mut files = vec![layer(
+            PakIniTarget::DeviceProfiles,
+            "[Windows DeviceProfile]\r\n;+CVars=r.MipMapLODBias=15\r\n+CVars=r.MipMapLODBias=15\r\n"
+                .into(),
+        )];
+        apply_edits_to_layers(&mut files, &[edit("r.MipMapLODBias", None)]);
+        assert_eq!(
+            files[0].content.matches("r.MipMapLODBias").count(),
+            1,
+            "the commented copy is documentation, not a setting:\n{}",
+            files[0].content
+        );
+    }
+
+    // ── Where a set lands inside a device profiles file ───────────────
+
+    #[test]
+    fn a_set_collapses_inherited_profiles_into_the_one_the_game_runs() {
+        let mut files = vec![layer(
+            PakIniTarget::DeviceProfiles,
+            concat!(
+                "[Windows DeviceProfile]\r\n",
+                "+CVars=r.Foo=0\r\n\r\n",
+                "[WindowsClient DeviceProfile]\r\n",
+                "+CVars=r.Foo=0\r\n"
+            )
+            .into(),
+        )];
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", Some("1"))]);
+
+        assert_eq!(
+            key_hits(&files, "r.Foo"),
+            vec![(PakIniTarget::DeviceProfiles, "1".into())]
+        );
+        let content = &files[0].content;
+        let windows = content
+            .find("[Windows DeviceProfile]")
+            .expect("windows section");
+        let client = content
+            .find("[WindowsClient DeviceProfile]")
+            .expect("client section");
+        let value = content.find("+CVars=r.Foo=1").expect("the surviving line");
+        assert!(
+            value > windows && value < client,
+            "the value belongs in the profile the others inherit from:\n{content}"
+        );
+    }
+
+    #[test]
+    fn a_set_reaches_the_primary_profile_even_when_the_key_lives_elsewhere() {
+        let mut files = vec![layer(
+            PakIniTarget::DeviceProfiles,
+            concat!(
+                "[Windows DeviceProfile]\r\n",
+                "DeviceType=Windows\r\n\r\n",
+                "[WindowsClient DeviceProfile]\r\n",
+                "+CVars=r.Foo=0\r\n"
+            )
+            .into(),
+        )];
+        apply_edits_to_layers(&mut files, &[edit("r.Foo", Some("1"))]);
+
+        let content = &files[0].content;
+        assert_eq!(key_hits(&files, "r.Foo").len(), 1);
+        let value = content.find("+CVars=r.Foo=1").expect("the moved line");
+        let client = content
+            .find("[WindowsClient DeviceProfile]")
+            .expect("client section");
+        assert!(
+            value < client,
+            "the override should move up to the profile the client runs:\n{content}"
+        );
+    }
+
+    // ── Merged read priority ──────────────────────────────────────────
+
+    #[test]
+    fn higher_layers_win_the_merged_read() {
+        let cases = [(0usize, 1usize), (1, 2), (2, 3), (3, 4)];
+        for (lower, higher) in cases {
+            let mut files = empty_pak();
+            let low_content = if files[lower].target.is_engine() {
+                "[ConsoleVariables]\r\nr.Shared=1\r\n".to_string()
+            } else {
+                "[Windows DeviceProfile]\r\n+CVars=r.Shared=1\r\n".to_string()
+            };
+            let high_content = if files[higher].target.is_engine() {
+                "[ConsoleVariables]\r\nr.Shared=9\r\n".to_string()
+            } else {
+                "[Windows DeviceProfile]\r\n+CVars=r.Shared=9\r\n".to_string()
+            };
+            files[lower].content = low_content;
+            files[higher].content = high_content;
+
+            let merged = merged(&files);
+            assert!(
+                merged.contains("r.Shared=9"),
+                "{:?} should win over {:?}:\n{merged}",
+                files[higher].target,
+                files[lower].target
+            );
+            assert!(!merged.contains("r.Shared=1"), "stale value in:\n{merged}");
+        }
+    }
+    // ── Presets: many tweaks applied in one pass ──────────────────────
+    //
+    // A preset is a saved list of tweak states. The app turns it into edits with
+    // `edits_for_settings` and hands the whole batch to one apply, so these check that a batch
+    // behaves like the sum of its parts: no tweak clobbers another, order does not matter, and
+    // what comes back out of detection is what was asked for.
+
+    fn is_remove_only(def: &TweakDefinition) -> bool {
+        matches!(
+            def.kind,
+            TweakKind::RemoveLines {
+                remove_only: true,
+                ..
+            }
+        )
+    }
+
+    /// A preset covering the whole catalogue, with `enabled` deciding each tweak.
+    ///
+    /// Remove-only tweaks are left out when off, matching the app: their lines are gone for good,
+    /// so asking for the off state is rejected rather than silently ignored.
+    fn preset(enabled: impl Fn(usize, &TweakDefinition) -> bool) -> Vec<TweakSetting> {
+        tweak_catalogue()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, def)| {
+                let on = enabled(index, def);
+                if !on && is_remove_only(def) {
+                    return None;
+                }
+                Some(TweakSetting {
+                    id: def.id.clone(),
+                    enabled: on,
+                    value: if on { slider_target(def) } else { None },
+                })
+            })
+            .collect()
+    }
+
+    /// The preset the app would save off a pak in its current state.
+    fn preset_from(files: &[LayerFile]) -> Vec<TweakSetting> {
+        let detected = states(files);
+        tweak_catalogue()
+            .iter()
+            .filter_map(|def| {
+                let state = detected.iter().find(|s| s.id == def.id);
+                let enabled = state.is_some_and(|s| s.active);
+                if !enabled && is_remove_only(def) {
+                    return None;
+                }
+                Some(TweakSetting {
+                    id: def.id.clone(),
+                    enabled,
+                    value: state.and_then(|s| s.current_value.clone()),
+                })
+            })
+            .collect()
+    }
+
+    fn apply_preset(files: &mut [LayerFile], settings: &[TweakSetting]) {
+        let edits = edits_for_settings(settings)
+            .unwrap_or_else(|e| panic!("preset failed to translate: {e}"));
+        apply_edits_to_layers(files, &edits);
+    }
+
+    fn states(files: &[LayerFile]) -> Vec<TweakState> {
+        detect_tweaks_unscoped(&merged(files))
+    }
+
+    fn assert_matches_request(files: &[LayerFile], settings: &[TweakSetting], what: &str) {
+        let detected = states(files);
+        for setting in settings {
+            let state = detected
+                .iter()
+                .find(|s| s.id == setting.id)
+                .unwrap_or_else(|| panic!("no detected state for {}", setting.id));
+            assert_eq!(
+                state.active, setting.enabled,
+                "{what}: {} was requested {} but reads {}",
+                setting.id, setting.enabled, state.active
+            );
+        }
+    }
+
+    fn contents(files: &[LayerFile]) -> Vec<String> {
+        files.iter().map(|f| f.content.clone()).collect()
+    }
+
+    /// Every key any tweak in the catalogue can write.
+    fn all_tweak_keys() -> Vec<String> {
+        let mut keys = Vec::new();
+        for def in tweak_catalogue() {
+            for edit in edits_on(&def) {
+                if !keys.contains(&edit.key) {
+                    keys.push(edit.key);
+                }
+            }
+        }
+        keys
+    }
+
+    /// A pak carrying every key a tweak can write, set to a value no tweak uses, in every file
+    /// and every live section. Whatever the preset asks for has to win over all of it.
+    fn dirty_pak() -> Vec<LayerFile> {
+        let seeds: Vec<PakTweakEdit> = tweak_catalogue().iter().flat_map(edits_on).collect();
+        seeded_pak(&seeds, "999")
+    }
+
+    /// Which tweaks a preset turns on, by catalogue position.
+    type Pattern = fn(usize, &TweakDefinition) -> bool;
+
+    #[test]
+    fn a_whole_catalogue_preset_lands_exactly_as_requested() {
+        let cases: [(&str, Pattern); 4] = [
+            ("all on", |_, _| true),
+            ("all off", |_, _| false),
+            ("alternating", |i, _| i % 2 == 0),
+            ("inverse alternating", |i, _| i % 2 == 1),
+        ];
+        for (label, pattern) in cases {
+            let settings = preset(pattern);
+            for (start, mut files) in [("clean", empty_pak()), ("dirty", dirty_pak())] {
+                apply_preset(&mut files, &settings);
+                assert_matches_request(&files, &settings, &format!("{label} on a {start} pak"));
+            }
+        }
+    }
+
+    #[test]
+    fn preset_entry_order_does_not_change_the_result() {
+        let forward = preset(|i, _| i % 3 != 0);
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let mut a = dirty_pak();
+        let mut b = dirty_pak();
+        apply_preset(&mut a, &forward);
+        apply_preset(&mut b, &reversed);
+
+        assert_eq!(
+            contents(&a),
+            contents(&b),
+            "a preset is a set of independent tweaks, so the list order must not matter"
+        );
+    }
+
+    #[test]
+    fn applying_a_preset_twice_changes_nothing() {
+        let settings = preset(|i, _| i % 2 == 0);
+        for mut files in [empty_pak(), dirty_pak()] {
+            apply_preset(&mut files, &settings);
+            let once = contents(&files);
+            apply_preset(&mut files, &settings);
+            assert_eq!(once, contents(&files), "a preset must be idempotent");
+        }
+    }
+
+    #[test]
+    fn a_preset_only_touches_the_tweaks_it_names() {
+        let everything_on = preset(|_, _| true);
+        let mut files = empty_pak();
+        apply_preset(&mut files, &everything_on);
+
+        let partial: Vec<TweakSetting> = everything_on
+            .iter()
+            .filter(|s| matches!(s.id.as_str(), "cas_sharpening" | "font_aa"))
+            .map(|s| TweakSetting {
+                enabled: false,
+                value: None,
+                ..s.clone()
+            })
+            .collect();
+        assert_eq!(partial.len(), 2, "both tweaks should be in the catalogue");
+        apply_preset(&mut files, &partial);
+
+        assert_matches_request(&files, &partial, "partial preset");
+        let untouched: Vec<TweakSetting> = everything_on
+            .iter()
+            .filter(|s| !partial.iter().any(|p| p.id == s.id))
+            .cloned()
+            .collect();
+        assert_matches_request(&files, &untouched, "tweaks the partial preset never named");
+    }
+
+    #[test]
+    fn a_preset_lands_the_same_state_on_a_dirty_pak_as_on_a_clean_one() {
+        let settings = preset(|i, _| i % 2 == 1);
+
+        let mut clean = empty_pak();
+        let mut dirty = dirty_pak();
+        apply_preset(&mut clean, &settings);
+        apply_preset(&mut dirty, &settings);
+
+        let clean_states = states(&clean);
+        let dirty_states = states(&dirty);
+        for def in tweak_catalogue() {
+            let a = clean_states
+                .iter()
+                .find(|s| s.id == def.id)
+                .map(|s| s.active);
+            let b = dirty_states
+                .iter()
+                .find(|s| s.id == def.id)
+                .map(|s| s.active);
+            assert_eq!(
+                a, b,
+                "{}: a preset should fully define the state, whatever the pak started with",
+                def.id
+            );
+        }
+    }
+
+    /// What the app does when you save a preset off one pak and apply it to another: the state it
+    /// captured has to reproduce itself, values included.
+    #[test]
+    fn a_preset_saved_off_a_pak_reproduces_that_pak_state() {
+        let mut source = dirty_pak();
+        apply_preset(&mut source, &preset(|i, _| i % 3 != 1));
+
+        let saved = preset_from(&source);
+        let mut target = empty_pak();
+        apply_preset(&mut target, &saved);
+
+        assert_matches_request(&target, &saved, "preset saved off another pak");
+        let detected = states(&target);
+        let mut compared = 0;
+        for setting in saved.iter().filter(|s| s.enabled && s.value.is_some()) {
+            let state = detected
+                .iter()
+                .find(|s| s.id == setting.id)
+                .unwrap_or_else(|| panic!("no state for {}", setting.id));
+            assert_eq!(
+                state.current_value, setting.value,
+                "{}: the value the preset captured should come back",
+                setting.id
+            );
+            compared += 1;
+        }
+        assert!(compared > 5, "only {compared} values were checked");
+    }
+
+    /// A tweak that is on by default reads active with no value behind it. The preset stores that
+    /// as `value: null`, and applying it has to write the value out rather than leave the file bare.
+    #[test]
+    fn a_preset_makes_a_default_on_tweak_explicit() {
+        let source = empty_pak();
+        let saved = preset_from(&source);
+        let cas = saved
+            .iter()
+            .find(|s| s.id == "cas_sharpening")
+            .expect("cas_sharpening is in the preset");
+        assert!(
+            cas.enabled && cas.value.is_none(),
+            "on by default, no value"
+        );
+
+        let mut target = dirty_pak();
+        apply_preset(&mut target, &saved);
+
+        let hits = key_hits(&target, "r.PostProcessing.EnableCAS");
+        assert!(
+            hits.iter().all(|(_, v)| v == "1"),
+            "the default has to be written out, not left to the stale value:\n{hits:#?}"
+        );
+        for target_layer in PakIniTarget::ALL {
+            assert!(
+                hits.iter().any(|(t, _)| *t == target_layer),
+                "{target_layer:?} kept its stale value:\n{hits:#?}"
+            );
+        }
+        assert_matches_request(&target, &saved, "preset from a bare pak");
+    }
+
+    /// The app disables engine-only tweaks for a pak with no engine file, but a preset can still
+    /// name them. Nothing is written for those, so the applied state does not match the request.
+    #[test]
+    fn engine_only_tweaks_in_a_preset_do_nothing_without_an_engine_file() {
+        let mut files: Vec<LayerFile> = empty_pak().into_iter().skip(3).collect();
+        assert!(files.iter().all(|f| !f.target.is_engine()));
+
+        let settings = vec![TweakSetting {
+            id: "application_scale".into(),
+            enabled: true,
+            value: Some("1.5".into()),
+        }];
+        apply_preset(&mut files, &settings);
+
+        assert!(
+            key_hits(&files, "ApplicationScale").is_empty(),
+            "an engine-section setting has nowhere to go in a device profiles file"
+        );
+        assert!(
+            !states(&files)
+                .iter()
+                .any(|s| s.id == "application_scale" && s.active),
+            "and it reads back off, so the request silently did not take"
+        );
+    }
+
+    /// Re-saving and re-applying must settle, not drift: the second pass has nothing left to do.
+    #[test]
+    fn saving_and_reapplying_a_preset_reaches_a_fixpoint() {
+        let mut files = dirty_pak();
+        apply_preset(&mut files, &preset(|i, _| i % 2 == 0));
+        let before = contents(&files);
+
+        let saved = preset_from(&files);
+        apply_preset(&mut files, &saved);
+
+        assert_eq!(
+            before,
+            contents(&files),
+            "re-applying what the pak already reads as should write nothing"
+        );
+    }
+
+    #[test]
+    fn every_file_agrees_on_every_key_after_a_preset() {
+        let mut files = dirty_pak();
+        apply_preset(&mut files, &preset(|i, _| i % 2 == 0));
+
+        let mut checked = 0;
+        for key in all_tweak_keys() {
+            let hits = key_hits(&files, &key);
+            let values: Vec<&String> = hits.iter().map(|(_, v)| v).collect();
+            if let Some(first) = values.first() {
+                assert!(
+                    values.iter().all(|v| v == first),
+                    "{key} disagrees across files, so which one applies depends on load order:\n{hits:#?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 10, "only {checked} keys survived the preset");
+    }
+
+    #[test]
+    fn a_preset_naming_the_same_tweak_twice_is_rejected() {
+        let mut settings = preset(|_, _| true);
+        let duplicate = settings[0].clone();
+        settings.push(duplicate);
+        assert!(edits_for_settings(&settings).is_err());
+    }
+
+    #[test]
+    fn a_preset_with_an_unknown_tweak_writes_nothing() {
+        let mut settings = preset(|_, _| true);
+        settings.push(TweakSetting {
+            id: "tweak_from_a_newer_build".into(),
+            enabled: true,
+            value: None,
+        });
+
+        let files = empty_pak();
+        let before = contents(&files);
+        assert!(
+            edits_for_settings(&settings).is_err(),
+            "an id this build does not know must not be silently skipped"
+        );
+        assert_eq!(
+            before,
+            contents(&files),
+            "translation fails before anything is written"
+        );
+    }
+
+    /// A preset saved off a pak whose slider sits outside the catalogue range cannot be applied
+    /// anywhere: `edits_for_settings` rejects the value, and the whole batch fails with it.
+    #[test]
+    fn a_preset_carrying_an_out_of_range_slider_is_rejected_whole() {
+        let mut source = empty_pak();
+        source[4].content = "[Windows DeviceProfile]\r\n+CVars=r.TeamOutline.LineMode=5\r\n".into();
+
+        let saved = preset_from(&source);
+        let captured = saved
+            .iter()
+            .find(|s| s.id == "team_outline_line_mode")
+            .expect("slider is in the preset");
+        assert_eq!(captured.value.as_deref(), Some("5"));
+
+        let err = edits_for_settings(&saved).expect_err("out-of-range value is rejected");
+        assert!(err.contains("outside"), "{err}");
+    }
 }

@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 use crate::pak::crypto::{make_aes_key, open_pak};
 use crate::pak::profile::{RIVALS_PROFILE, strip_mount_prefix};
 
-use super::{PakIniInfo, PakIniListing};
+use super::{PakIniInfo, PakIniListing, PakIniTarget};
 
 /// List every `.ini` entry inside a pak; `None` if none present.
 pub(super) fn inspect_pak_for_any_ini(pak_path: &Path) -> Result<Option<PakIniListing>, String> {
@@ -38,36 +38,57 @@ pub(super) fn inspect_pak_for_any_ini(pak_path: &Path) -> Result<Option<PakIniLi
     }))
 }
 
+/// Which config layer a pak entry belongs to, or `None` when the tweak engine does not
+/// understand the file.
+pub(super) fn classify_ini_entry(entry: &str) -> Option<PakIniTarget> {
+    let lower = entry.to_ascii_lowercase();
+    if lower.ends_with("basedeviceprofiles.ini") {
+        Some(PakIniTarget::BaseDeviceProfiles)
+    } else if lower.ends_with("defaultdeviceprofiles.ini") {
+        Some(PakIniTarget::DeviceProfiles)
+    } else if lower.ends_with("defaultengine.ini") {
+        Some(PakIniTarget::Engine)
+    } else if lower.ends_with("windowsengine.ini") {
+        Some(PakIniTarget::WindowsEngine)
+    } else if lower.ends_with("baseengine.ini") {
+        Some(PakIniTarget::BaseEngine)
+    } else {
+        None
+    }
+}
+
+/// Order two files that share a layer, matching the order UE loads them in: the `Base*`
+/// variant first, then the project copy that overrides it.
+fn load_order_key(entry: &str) -> (u8, String) {
+    let lower = entry.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower).to_string();
+    (u8::from(!name.starts_with("base")), lower)
+}
+
 /// Inspect a pak for tweakable INI entries.
 pub(super) fn inspect_pak_for_ini(pak_path: &Path) -> Result<Option<PakIniInfo>, String> {
     let pak = open_pak(pak_path)?;
-    let files = pak.files();
 
-    let mut device_profiles_entry = None;
-    let mut engine_ini_entry = None;
-    let mut base_engine_entry = None;
-    let mut windows_engine_entry = None;
-
-    for f in &files {
-        let lower = f.to_ascii_lowercase();
-        if lower.ends_with("defaultdeviceprofiles.ini") {
-            device_profiles_entry = Some(f.clone());
-        } else if lower.ends_with("defaultengine.ini") {
-            engine_ini_entry = Some(f.clone());
-        } else if lower.ends_with("baseengine.ini") {
-            base_engine_entry = Some(f.clone());
-        } else if lower.ends_with("windowsengine.ini") {
-            windows_engine_entry = Some(f.clone());
+    let mut buckets: [Vec<String>; 5] = Default::default();
+    for f in pak.files() {
+        if let Some(target) = classify_ini_entry(&f) {
+            let slot = PakIniTarget::ALL
+                .iter()
+                .position(|t| *t == target)
+                .unwrap_or_default();
+            buckets[slot].push(f);
         }
     }
-
-    if device_profiles_entry.is_none()
-        && engine_ini_entry.is_none()
-        && base_engine_entry.is_none()
-        && windows_engine_entry.is_none()
-    {
-        return Ok(None);
+    for bucket in &mut buckets {
+        bucket.sort_by_key(|entry| load_order_key(entry));
     }
+    let [
+        base_engine_entries,
+        engine_ini_entries,
+        windows_engine_entries,
+        base_device_profiles_entries,
+        device_profiles_entries,
+    ] = buckets;
 
     let pak_name = pak_path
         .file_name()
@@ -75,18 +96,25 @@ pub(super) fn inspect_pak_for_ini(pak_path: &Path) -> Result<Option<PakIniInfo>,
         .to_string_lossy()
         .into_owned();
 
-    Ok(Some(PakIniInfo {
+    let info = PakIniInfo {
         pak_name,
         pak_path: pak_path.to_string_lossy().into_owned(),
-        has_device_profiles: device_profiles_entry.is_some(),
-        has_engine_ini: engine_ini_entry.is_some(),
-        has_base_engine: base_engine_entry.is_some(),
-        has_windows_engine: windows_engine_entry.is_some(),
-        device_profiles_entry,
-        engine_ini_entry,
-        base_engine_entry,
-        windows_engine_entry,
-    }))
+        has_device_profiles: !device_profiles_entries.is_empty(),
+        has_base_device_profiles: !base_device_profiles_entries.is_empty(),
+        has_engine_ini: !engine_ini_entries.is_empty(),
+        has_base_engine: !base_engine_entries.is_empty(),
+        has_windows_engine: !windows_engine_entries.is_empty(),
+        device_profiles_entries,
+        base_device_profiles_entries,
+        engine_ini_entries,
+        base_engine_entries,
+        windows_engine_entries,
+    };
+
+    if info.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(info))
 }
 
 /// Extract one pak entry to a UTF-8 string.
@@ -131,7 +159,7 @@ pub(super) fn extract_optional_entry(
 }
 
 /// Extract all pak entries to a directory.
-pub(super) fn unpack_to_dir(pak_path: &Path, output_dir: &Path) -> Result<(), String> {
+pub(crate) fn unpack_to_dir(pak_path: &Path, output_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(output_dir).map_err(|e| e.to_string())?;
 
     let pak = open_pak(pak_path)?;
@@ -154,7 +182,7 @@ pub(super) fn unpack_to_dir(pak_path: &Path, output_dir: &Path) -> Result<(), St
 /// Write a brand-new empty pak (no entries) at `output_pak`. Used by the
 /// "New pak" flow so users can populate INI files via the editor instead of
 /// staging a folder layout by hand first.
-pub(super) fn create_empty_pak(output_pak: &Path) -> Result<(), String> {
+pub(crate) fn create_empty_pak(output_pak: &Path) -> Result<(), String> {
     use std::io::BufWriter;
 
     if let Some(parent) = output_pak.parent() {
@@ -237,7 +265,7 @@ impl Drop for TempDirGuard {
 /// `modify` receives the temp directory root and returns any error to abort the
 /// operation before touching the original pak. On swap failure the original is
 /// restored from the `.bak` backup.
-pub(super) fn with_unpacked_pak<F>(pak_path: &Path, modify: F) -> Result<(), String>
+pub(crate) fn with_unpacked_pak<F>(pak_path: &Path, modify: F) -> Result<(), String>
 where
     F: FnOnce(&Path) -> Result<(), String>,
 {
@@ -276,4 +304,73 @@ where
     let _ = fs::remove_file(&backup);
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Every INI a Marvel Rivals config pak can ship has to reach a layer. `BaseDeviceProfiles.ini`
+    /// used to fall through and stayed untouched while the toggle reported the fix as applied.
+    #[test]
+    fn every_shipped_config_file_maps_to_a_layer() {
+        let cases = [
+            (
+                "Engine/Config/BaseDeviceProfiles.ini",
+                Some(PakIniTarget::BaseDeviceProfiles),
+            ),
+            (
+                "Marvel/Config/DefaultDeviceProfiles.ini",
+                Some(PakIniTarget::DeviceProfiles),
+            ),
+            (
+                "Engine/Config/BaseEngine.ini",
+                Some(PakIniTarget::BaseEngine),
+            ),
+            (
+                "Marvel/Config/DefaultEngine.ini",
+                Some(PakIniTarget::Engine),
+            ),
+            (
+                "Marvel/Config/Windows/WindowsEngine.ini",
+                Some(PakIniTarget::WindowsEngine),
+            ),
+            (
+                "Engine/Config/Windows/BaseWindowsEngine.ini",
+                Some(PakIniTarget::WindowsEngine),
+            ),
+            (
+                "../../../Marvel/Config/DefaultEngine.ini",
+                Some(PakIniTarget::Engine),
+            ),
+            (
+                "MARVEL/CONFIG/DEFAULTENGINE.INI",
+                Some(PakIniTarget::Engine),
+            ),
+            ("Marvel/Config/DefaultGame.ini", None),
+            ("Marvel/Config/Windows/WindowsGame.ini", None),
+        ];
+        for (entry, expected) in cases {
+            assert_eq!(classify_ini_entry(entry), expected, "classifying {entry}");
+        }
+    }
+
+    /// Two files can share a layer, and the project copy overrides the `Base*` variant, so the
+    /// merged read has to see them in that order.
+    #[test]
+    fn base_variants_sort_before_the_project_copy() {
+        let mut entries = vec![
+            "Marvel/Config/Windows/WindowsEngine.ini".to_string(),
+            "Engine/Config/Windows/BaseWindowsEngine.ini".to_string(),
+        ];
+        entries.sort_by_key(|entry| load_order_key(entry));
+        assert_eq!(
+            entries,
+            vec![
+                "Engine/Config/Windows/BaseWindowsEngine.ini".to_string(),
+                "Marvel/Config/Windows/WindowsEngine.ini".to_string(),
+            ]
+        );
+    }
 }
